@@ -1,9 +1,14 @@
 """Request/response schemas."""
 from __future__ import annotations
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from .stats import DIM
+
+#: Bound on integer speed/pressure endpoints and gears.  Generous for real
+#: transducer counts (even 1e12 base values) but keeps every exact
+#: Fraction-to-float conversion and response number in range.
+MAX_INT_MAGNITUDE = 10**18
 
 
 class FactoryPayload(BaseModel):
@@ -49,3 +54,64 @@ class PredictRequest(BaseModel):
     factory_id: str = Field(min_length=1, max_length=64)
     speed: float
     pressure: float
+
+
+class GearRequest(BaseModel):
+    """Conditions under which a usable integer gear is requested.
+
+    ``pressure_min``/``pressure_max`` are *raw* integer pressure readings;
+    the factory's current correction is applied by the service.  The
+    pressure interval may be given in either order.
+    """
+
+    factory_id: str = Field(min_length=1, max_length=64)
+    pressure_min: int = Field(ge=-MAX_INT_MAGNITUDE, le=MAX_INT_MAGNITUDE)
+    pressure_max: int = Field(ge=-MAX_INT_MAGNITUDE, le=MAX_INT_MAGNITUDE)
+    speed_min: int = Field(ge=-MAX_INT_MAGNITUDE, le=MAX_INT_MAGNITUDE)
+    speed_max: int = Field(ge=-MAX_INT_MAGNITUDE, le=MAX_INT_MAGNITUDE)
+    power_limit: float = Field(gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _ranges(self):
+        if self.speed_min > self.speed_max:
+            raise ValueError("speed_min must be <= speed_max")
+        return self
+
+
+class GearReviewRequest(GearRequest):
+    """Original conditions plus the gear chosen by the dispatcher."""
+
+    gear: int = Field(ge=-MAX_INT_MAGNITUDE, le=MAX_INT_MAGNITUDE)
+
+
+class GearSelectionResponse(BaseModel):
+    factory_id: str
+    available: bool
+    gear: int | None
+    version: int
+    correction: int
+    power_limit: float
+    mahalanobis_limit: int
+    max_power: float | None
+    max_distance: float | None
+
+
+class GearSuggestion(BaseModel):
+    available: bool
+    gear: int | None
+    max_power: float | None
+    max_distance: float | None
+
+
+class GearReviewResponse(BaseModel):
+    factory_id: str
+    accepted: bool
+    gear: int
+    version: int
+    correction: int
+    power_limit: float
+    mahalanobis_limit: int
+    max_power: float | None
+    max_distance: float | None
+    reasons: list[str]
+    suggestion: GearSuggestion | None = None

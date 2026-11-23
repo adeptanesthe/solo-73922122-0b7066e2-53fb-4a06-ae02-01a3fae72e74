@@ -4,10 +4,15 @@ from __future__ import annotations
 import os
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
 
 from . import db as dbmod
+from .gear import (MAHALANOBIS_LIMIT, OperatingPoint, review_gear,
+                   select_gear)
 from .model import RidgeModel, train
-from .schemas import (CorrectionUpdate, CreateVersionRequest, PredictRequest)
+from .schemas import (CorrectionUpdate, CreateVersionRequest, GearRequest,
+                      GearReviewRequest, GearReviewResponse,
+                      GearSelectionResponse, PredictRequest)
 from .stats import InvalidStats, Stats, apply_correction
 
 DB_PATH = os.environ.get("DB_PATH", os.path.join("data", "platform.db"))
@@ -44,6 +49,24 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "model": view["model"],
             "created_at": view["created_at"],
         }
+
+    def _gear_context(view: dict, factory_id: str):
+        """One version's correction, summary and model for a factory."""
+        for f in view["factories"]:
+            if f["factory_id"] == factory_id:
+                stats = Stats.build(f["n"], f["sums"], f["outer"])
+                op = OperatingPoint.build(stats, f["correction"])
+                model = RidgeModel.from_dict(view["model"])
+                return f["correction"], op, model
+        raise HTTPException(
+            status_code=404, detail=f"unknown factory {factory_id!r}"
+        )
+
+    def _current_view():
+        view = store.get_current()
+        if view is None:
+            raise HTTPException(status_code=503, detail="no model version yet")
+        return view
 
     # ------------------------------------------------------------- routes
     @app.get("/health")
@@ -145,6 +168,85 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "power": power,
             "version": view["version"],
         }
+
+    @app.post("/gear/select", response_model=GearSelectionResponse)
+    def gear_select(req: GearRequest):
+        """Highest usable integer gear under pressure interval + power cap.
+
+        Conditions are checked over the *whole* corrected pressure
+        interval.  Everything -- correction, summary statistics and model
+        -- comes from the one committed current version returned below.
+        No gear is tried one by one: the feasible speed set is solved
+        analytically.  Returns ``available: false`` when no gear qualifies.
+        """
+        view = _current_view()
+        correction, op, model = _gear_context(view, req.factory_id)
+        p_lo, p_hi = sorted((req.pressure_min, req.pressure_max))
+        selection = select_gear(
+            op, model,
+            p_lo + correction, p_hi + correction,
+            req.speed_min, req.speed_max, req.power_limit,
+        )
+        return {
+            "factory_id": req.factory_id,
+            "available": selection.available,
+            "gear": selection.gear,
+            "version": view["version"],
+            "correction": correction,
+            "power_limit": req.power_limit,
+            "mahalanobis_limit": MAHALANOBIS_LIMIT,
+            "max_power": selection.max_power,
+            "max_distance": selection.max_distance,
+        }
+
+    @app.post("/gear/review", response_model=GearReviewResponse,
+              responses={409: {"model": GearReviewResponse,
+                               "description": "gear not usable under the "
+                                              "current version; suggestion "
+                                              "attached"}})
+    def gear_review(req: GearReviewRequest):
+        """Re-check a gear chosen earlier, against the current version.
+
+        The original conditions are replayed.  If the version changed in
+        between (e.g. a correction update), the *new* version's correction,
+        summary and model decide.  An unusable gear is rejected with
+        409 and the current suggestion is included.
+        """
+        view = _current_view()
+        correction, op, model = _gear_context(view, req.factory_id)
+        p_lo, p_hi = sorted((req.pressure_min, req.pressure_max))
+        review = review_gear(
+            op, model, req.gear,
+            p_lo + correction, p_hi + correction,
+            req.speed_min, req.speed_max, req.power_limit,
+        )
+        body = {
+            "factory_id": req.factory_id,
+            "accepted": review.accepted,
+            "gear": req.gear,
+            "version": view["version"],
+            "correction": correction,
+            "power_limit": req.power_limit,
+            "mahalanobis_limit": MAHALANOBIS_LIMIT,
+            "max_power": review.max_power,
+            "max_distance": review.max_distance,
+            "reasons": list(review.reasons),
+        }
+        if review.accepted:
+            return body
+        # Rejected: attach the current version's own suggestion.
+        suggested = select_gear(
+            op, model,
+            p_lo + correction, p_hi + correction,
+            req.speed_min, req.speed_max, req.power_limit,
+        )
+        body["suggestion"] = {
+            "available": suggested.available,
+            "gear": suggested.gear,
+            "max_power": suggested.max_power,
+            "max_distance": suggested.max_distance,
+        }
+        return JSONResponse(status_code=409, content=body)
 
     return app
 

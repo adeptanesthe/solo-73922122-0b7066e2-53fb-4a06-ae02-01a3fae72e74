@@ -1,0 +1,8 @@
+{
+ "factory_id": "F3",
+ "pressure_min": 500000,
+ "pressure_max": 500030,
+ "speed_min": 999900,
+ "speed_max": 1000200,
+ "power_limit": 27007
+}

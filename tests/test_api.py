@@ -242,3 +242,192 @@ def test_beyond_int64_values_keep_variance(client):
     # edge factories extrapolate in LOFO, but if variance had collapsed to
     # zero the speed feature would be dropped and errors would be ~1e6+
     assert max(errs.values()) < 1e5
+
+
+# ---------------------------------------------------------------- gear API
+GEAR_CONDITIONS = {
+    "pressure_min": 500_000,
+    "pressure_max": 500_030,
+    "speed_min": 999_900,
+    "speed_max": 1_000_200,
+    "power_limit": 27_007,
+}
+
+
+def select(client, **overrides):
+    body = {"factory_id": "F3", **GEAR_CONDITIONS, **overrides}
+    return client.post("/gear/select", json=body)
+
+
+def review(client, gear, **overrides):
+    body = {"factory_id": "F3", "gear": gear, **GEAR_CONDITIONS, **overrides}
+    return client.post("/gear/review", json=body)
+
+
+def test_gear_select_returns_highest_usable(client):
+    create(client)
+    r = select(client)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["available"] is True
+    assert body["version"] == 1
+    assert body["correction"] == 0
+    assert isinstance(body["gear"], int)
+    assert body["max_power"] <= GEAR_CONDITIONS["power_limit"]
+    assert body["max_distance"] <= 3.0
+    # with an unconstrained cap only the distance bound is left: the picked
+    # gear is the highest one satisfying it, and one more is rejected.
+    top = select(client, power_limit=1e9).json()
+    assert top["gear"] >= body["gear"]
+    over = review(client, top["gear"] + 1, power_limit=1e9)
+    assert over.status_code == 409
+    assert "mahalanobis" in over.json()["reasons"]
+
+
+def test_gear_select_uses_raw_pressure_and_one_version(client):
+    create(client)
+    before = select(client).json()
+    # reversing the raw endpoints must not change the answer
+    reversed_ = select(client, pressure_min=500_030,
+                       pressure_max=500_000).json()
+    assert reversed_["gear"] == before["gear"]
+    assert reversed_["version"] == before["version"]
+
+    after_corr = client.post(
+        "/versions/1/correction", json={"factory_id": "F3", "correction": 500}
+    )
+    assert after_corr.status_code == 200
+    new = select(client).json()
+    assert new["version"] == 2
+    assert new["correction"] == 500
+    # the correction changes the summary mean and the model together
+    assert new["max_power"] != before["max_power"]
+
+
+def test_gear_select_no_usable_gear(client):
+    create(client)
+    r = select(client, power_limit=1)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["available"] is False
+    assert body["gear"] is None
+    # pressure far outside the factory's operating range
+    far = select(client, pressure_min=900_000, pressure_max=900_001).json()
+    assert far["available"] is False and far["gear"] is None
+
+
+def test_gear_select_unknown_factory_and_no_model(client):
+    assert select(client).status_code == 503
+    create(client)
+    r = select(client, factory_id="NOPE")
+    assert r.status_code == 404
+
+
+def test_gear_select_rejects_bad_ranges(client):
+    create(client)
+    assert select(client, speed_min=10, speed_max=5).status_code == 422
+    assert select(client, power_limit=0).status_code == 422
+    assert select(client, pressure_min=1.5).status_code == 422
+
+
+def test_gear_review_accepts_same_version_selection(client):
+    create(client)
+    chosen = select(client).json()["gear"]
+    r = review(client, chosen)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["accepted"] is True
+    assert body["reasons"] == []
+    assert body["version"] == 1
+
+
+def test_gear_review_rejects_after_version_change_with_suggestion(client):
+    create(client)
+    # Unconstrained cap: the distance bound alone decides the highest gear.
+    top = select(client, power_limit=1e9).json()
+    chosen = top["gear"]
+    # Set the cap just at that gear's worst predicted power (tiny slack for
+    # the float serialisation), so it passes under version 1 with no margin.
+    limit = top["max_power"] * (1 + 1e-9)
+    r = review(client, chosen, power_limit=limit)
+    assert r.status_code == 200
+    assert r.json()["accepted"] is True
+
+    client.post("/versions/1/correction",
+                json={"factory_id": "F3", "correction": 500})
+    r = review(client, chosen, power_limit=limit)
+    assert r.status_code == 409, r.text
+    body = r.json()
+    assert body["accepted"] is False
+    assert body["version"] == 2
+    assert body["correction"] == 500
+    assert "power_limit" in body["reasons"]
+    assert body["suggestion"]["available"] is True
+    assert body["suggestion"]["gear"] < chosen
+    # the suggestion is the current version's own selection
+    assert body["suggestion"]["gear"] == select(
+        client, power_limit=limit).json()["gear"]
+
+
+def test_gear_review_same_conditions_rechecked_after_retrain(client):
+    create(client)
+    top = select(client, power_limit=1e9).json()
+    limit = top["max_power"] * (1 + 1e-9)
+    client.post("/versions/1/correction",
+                json={"factory_id": "F3", "correction": 500})
+    # the current version's own gear passes its own conditions
+    fresh = select(client, power_limit=limit).json()["gear"]
+    ok = review(client, fresh, power_limit=limit)
+    assert ok.status_code == 200
+    assert ok.json()["version"] == 2
+    assert ok.json()["gear"] == fresh
+
+
+def test_gear_review_out_of_range_gear(client):
+    create(client)
+    r = review(client, 5)
+    assert r.status_code == 409
+    assert "speed_range" in r.json()["reasons"]
+    assert "suggestion" in r.json()
+
+
+def test_gear_select_during_recompute_uses_current_version(client,
+                                                          monkeypatch):
+    import threading
+
+    import app.main as main_mod
+
+    create(client)
+    first = select(client).json()
+    orig_train = main_mod.train
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_train(stats):
+        started.set()
+        assert release.wait(10)
+        return orig_train(stats)
+
+    monkeypatch.setattr(main_mod, "train", slow_train)
+    outcome = {}
+
+    def do_update():
+        r = client.post("/versions/1/correction",
+                        json={"factory_id": "F3", "correction": 500})
+        outcome["status"] = r.status_code
+
+    t = threading.Thread(target=do_update)
+    t.start()
+    assert started.wait(10)
+    # mid-recompute, selection stays on committed version 1: correction,
+    # summary and model all from that one version
+    for _ in range(5):
+        body = select(client).json()
+        assert body["version"] == 1
+        assert body["correction"] == 0
+        assert body["gear"] == first["gear"]
+    release.set()
+    t.join(10)
+    assert outcome["status"] == 200
+    after = select(client).json()
+    assert after["version"] == 2 and after["correction"] == 500
